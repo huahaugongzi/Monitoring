@@ -42,4 +42,6 @@ open /Applications/Monitoring.app
 
 退出：点击任意一个状态项 → 退出。若全部状态项都被拖出菜单栏，重新打开应用会自动恢复显示。
 
+网络测速：点击任意状态项 → 网络测速，弹窗依次测试延迟（Cloudflare ping 3 次平均）、下行（10MB）、上行（5MB），完成后结果停留 5 秒自动关闭。
+
 图标源文件在 `tools/makeicon.swift`，重新生成：`swift tools/makeicon.swift . && iconutil -c icns AppIcon.iconset -o AppIcon.icns`。

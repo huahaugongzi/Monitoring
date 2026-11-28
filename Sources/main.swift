@@ -439,6 +439,100 @@ final class NetBlockView: PassthroughView {
     }
 }
 
+// MARK: - 网络测速
+
+final class SpeedTest {
+    enum Phase: String {
+        case ping = "测延迟"
+        case download = "测下行"
+        case upload = "测上行"
+        case done = "完成"
+    }
+
+    struct Result {
+        var ping: Double?      // ms
+        var download: Double?  // MB/s
+        var upload: Double?    // MB/s
+    }
+
+    private var progress: ((Phase, Result) -> Void)?
+    private var completion: ((Result) -> Void)?
+
+    func run(progress: @escaping (Phase, Result) -> Void,
+             completion: @escaping (Result) -> Void) {
+        self.progress = progress
+        self.completion = completion
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.execute()
+        }
+    }
+
+    private func execute() {
+        var r = Result()
+
+        // 1. 延迟（3次平均）
+        notify(.ping, r)
+        var pings: [Double] = []
+        for _ in 0..<3 {
+            let start = CFAbsoluteTimeGetCurrent()
+            let p = Process()
+            p.launchPath = "/usr/bin/curl"
+            p.arguments = ["-s", "-o", "/dev/null", "-w", "", "--max-time", "2",
+                           "https://speed.cloudflare.com"]
+            p.standardOutput = Pipe()
+            p.standardError = Pipe()
+            p.launch()
+            p.waitUntilExit()
+            let dt = CFAbsoluteTimeGetCurrent() - start
+            if p.terminationStatus == 0 { pings.append(dt * 1000) }
+        }
+        r.ping = pings.isEmpty ? nil : pings.reduce(0, +) / Double(pings.count)
+
+        // 2. 下行（10MB）
+        notify(.download, r)
+        let dlStart = CFAbsoluteTimeGetCurrent()
+        let dlProc = Process()
+        dlProc.launchPath = "/usr/bin/curl"
+        dlProc.arguments = ["-s", "-o", "/dev/null", "-w", "", "--max-time", "10",
+                            "https://speed.cloudflare.com/__down?bytes=10000000"]
+        dlProc.standardOutput = Pipe()
+        dlProc.standardError = Pipe()
+        dlProc.launch()
+        dlProc.waitUntilExit()
+        let dlDt = CFAbsoluteTimeGetCurrent() - dlStart
+        if dlProc.terminationStatus == 0, dlDt > 0.1 {
+            r.download = 10.0 / dlDt  // MB/s
+        }
+
+        // 3. 上行（5MB）
+        notify(.upload, r)
+        let ulProc = Process()
+        ulProc.launchPath = "/bin/sh"
+        ulProc.arguments = ["-c",
+            "head -c 5000000 /dev/zero | /usr/bin/curl -s -o /dev/null -w '' --max-time 10 -X POST --data-binary @- https://speed.cloudflare.com/__up"]
+        ulProc.standardOutput = Pipe()
+        ulProc.standardError = Pipe()
+        let ulStart = CFAbsoluteTimeGetCurrent()
+        ulProc.launch()
+        ulProc.waitUntilExit()
+        let ulDt = CFAbsoluteTimeGetCurrent() - ulStart
+        if ulProc.terminationStatus == 0, ulDt > 0.1 {
+            r.upload = 5.0 / ulDt  // MB/s
+        }
+
+        notify(.done, r)
+        DispatchQueue.main.async { [weak self] in
+            self?.completion?(r)
+        }
+    }
+
+    private func notify(_ phase: Phase, _ r: Result) {
+        DispatchQueue.main.async { [weak self] in
+            self?.progress?(phase, r)
+        }
+    }
+}
+
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -500,6 +594,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    private var speedTestMenuItem: NSMenuItem?
+    private var speedTestWindow: NSWindow?
+
     private func makeItem(_ view: PassthroughView, autosave: String,
                           accessibility: String) -> NSStatusItem {
         let item = NSStatusBar.system.statusItem(withLength: view.frame.width)
@@ -513,6 +610,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let menu = NSMenu()
         menu.delegate = self
+
+        let speedItem = NSMenuItem(title: "网络测速", action: #selector(runSpeedTest(_:)),
+                                   keyEquivalent: "")
+        speedItem.target = self
+        menu.addItem(speedItem)
+        menu.addItem(.separator())
+
         let launch = NSMenuItem(title: "开机自启动",
                                 action: #selector(toggleLaunchAtLogin(_:)), keyEquivalent: "")
         launch.target = self
@@ -522,6 +626,78 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                 keyEquivalent: "q"))
         item.menu = menu
         return item
+    }
+
+    @objc private func runSpeedTest(_ sender: NSMenuItem) {
+        if speedTestWindow != nil { return }
+
+        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 300, height: 160),
+                           styleMask: [.titled, .closable],
+                           backing: .buffered, defer: false)
+        win.title = "网络测速"
+        win.center()
+        win.isReleasedWhenClosed = false
+
+        let textView = NSTextView(frame: win.contentView!.bounds)
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
+        textView.autoresizingMask = [.width, .height]
+        textView.textContainerInset = NSSize(width: 12, height: 12)
+        win.contentView?.addSubview(textView)
+
+        speedTestWindow = win
+        win.makeKeyAndOrderFront(nil)
+
+        textView.string = "准备测速...\n"
+
+        let test = SpeedTest()
+        test.run(progress: { [weak textView] phase, result in
+            var lines = ""
+            if let p = result.ping {
+                lines += String(format: "延迟: %.0f ms\n", p)
+            } else if phase == .ping {
+                lines += "延迟: 测试中...\n"
+            }
+            if let d = result.download {
+                lines += String(format: "下行: %.1f MB/s\n", d)
+            } else if phase == .download {
+                lines += "下行: 测试中...\n"
+            }
+            if let u = result.upload {
+                lines += String(format: "上行: %.1f MB/s\n", u)
+            } else if phase == .upload {
+                lines += "上行: 测试中...\n"
+            }
+            textView?.string = lines
+        }, completion: { [weak self, weak win] result in
+            guard let self, let win else { return }
+            var final = ""
+            if let p = result.ping {
+                final += String(format: "延迟: %.0f ms\n", p)
+            } else {
+                final += "延迟: 测试失败\n"
+            }
+            if let d = result.download {
+                final += String(format: "下行: %.1f MB/s\n", d)
+            } else {
+                final += "下行: 测试失败\n"
+            }
+            if let u = result.upload {
+                final += String(format: "上行: %.1f MB/s\n", u)
+            } else {
+                final += "上行: 测试失败\n"
+            }
+            final += "\n测速完成"
+            textView.string = final
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+                if win.isVisible {
+                    win.close()
+                    self.speedTestWindow = nil
+                }
+            }
+        })
     }
 
     // 打开菜单时刷新「开机自启动」勾选状态
