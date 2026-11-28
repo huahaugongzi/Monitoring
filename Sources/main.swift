@@ -474,51 +474,48 @@ final class SpeedTest {
         notify(.ping, r)
         var pings: [Double] = []
         for _ in 0..<3 {
+            let sem = DispatchSemaphore(value: 0)
             let start = CFAbsoluteTimeGetCurrent()
-            let p = Process()
-            p.launchPath = "/usr/bin/curl"
-            p.arguments = ["-s", "-o", "/dev/null", "-w", "", "--max-time", "2",
-                           "https://speed.cloudflare.com"]
-            p.standardOutput = Pipe()
-            p.standardError = Pipe()
-            p.launch()
-            p.waitUntilExit()
-            let dt = CFAbsoluteTimeGetCurrent() - start
-            if p.terminationStatus == 0 { pings.append(dt * 1000) }
+            URLSession.shared.dataTask(with: URL(string: "https://speed.cloudflare.com")!) { _, _, _ in
+                let dt = CFAbsoluteTimeGetCurrent() - start
+                if dt < 3 { pings.append(dt * 1000) }
+                sem.signal()
+            }.resume()
+            _ = sem.wait(timeout: .now() + 3)
         }
         r.ping = pings.isEmpty ? nil : pings.reduce(0, +) / Double(pings.count)
+        notify(.ping, r)
 
         // 2. 下行（10MB）
         notify(.download, r)
+        let dlSem = DispatchSemaphore(value: 0)
         let dlStart = CFAbsoluteTimeGetCurrent()
-        let dlProc = Process()
-        dlProc.launchPath = "/usr/bin/curl"
-        dlProc.arguments = ["-s", "-o", "/dev/null", "-w", "", "--max-time", "10",
-                            "https://speed.cloudflare.com/__down?bytes=10000000"]
-        dlProc.standardOutput = Pipe()
-        dlProc.standardError = Pipe()
-        dlProc.launch()
-        dlProc.waitUntilExit()
-        let dlDt = CFAbsoluteTimeGetCurrent() - dlStart
-        if dlProc.terminationStatus == 0, dlDt > 0.1 {
-            r.download = 10.0 / dlDt  // MB/s
-        }
+        URLSession.shared.dataTask(with: URL(string: "https://speed.cloudflare.com/__down?bytes=10000000")!) { data, _, _ in
+            let dlDt = CFAbsoluteTimeGetCurrent() - dlStart
+            if dlDt > 0.1, let size = data?.count, size > 1_000_000 {
+                r.download = Double(size) / 1_000_000.0 / dlDt
+            }
+            dlSem.signal()
+        }.resume()
+        _ = dlSem.wait(timeout: .now() + 15)
+        notify(.download, r)
 
         // 3. 上行（5MB）
         notify(.upload, r)
-        let ulProc = Process()
-        ulProc.launchPath = "/bin/sh"
-        ulProc.arguments = ["-c",
-            "head -c 5000000 /dev/zero | /usr/bin/curl -s -o /dev/null -w '' --max-time 10 -X POST --data-binary @- https://speed.cloudflare.com/__up"]
-        ulProc.standardOutput = Pipe()
-        ulProc.standardError = Pipe()
+        let ulSem = DispatchSemaphore(value: 0)
         let ulStart = CFAbsoluteTimeGetCurrent()
-        ulProc.launch()
-        ulProc.waitUntilExit()
-        let ulDt = CFAbsoluteTimeGetCurrent() - ulStart
-        if ulProc.terminationStatus == 0, ulDt > 0.1 {
-            r.upload = 5.0 / ulDt  // MB/s
-        }
+        var req = URLRequest(url: URL(string: "https://speed.cloudflare.com/__up")!)
+        req.httpMethod = "POST"
+        req.httpBody = Data(count: 5_000_000)
+        URLSession.shared.dataTask(with: req) { _, _, _ in
+            let ulDt = CFAbsoluteTimeGetCurrent() - ulStart
+            if ulDt > 0.1 {
+                r.upload = 5.0 / ulDt
+            }
+            ulSem.signal()
+        }.resume()
+        _ = ulSem.wait(timeout: .now() + 15)
+        notify(.upload, r)
 
         notify(.done, r)
         DispatchQueue.main.async { [weak self] in
